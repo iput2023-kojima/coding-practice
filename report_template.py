@@ -23,6 +23,10 @@ def create_report():
 ======================
 """
     print(report)
+
+    with open("report.txt", "w", encoding="utf-8") as f:
+        f.write(report)
+
     return report
 
 
