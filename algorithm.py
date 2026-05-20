@@ -6,7 +6,7 @@ from collections import defaultdict
 CONTAINER_WIDTH = 2300
 CONTAINER_LENGTH = 12000
 CONTAINER_HEIGHT = 2400
-MAX_WEIGHT = 24000
+MAX_WEIGHT = 24000  # 24トン制限
 
 CONTAINER_VOLUME = CONTAINER_WIDTH * CONTAINER_LENGTH * CONTAINER_HEIGHT
 
@@ -38,18 +38,16 @@ def item_volume(item):
 
 def sort_items(items):
     """
-    【充填率特化ソート】
-    1. 目的地ごと
-    2. 底面積（W × L）が広い順（安定した大きな土台を下に敷き詰める）
-    3. 体積が大きい順
+    【合格最優先ソート】
+    重い荷物や底面積の広い荷物を下に敷き詰めることで、重量・支持面違反を防ぐ
     """
     return sorted(
         items,
         key=lambda x: (
             x["destination_id"],
+            -x["weight"],  # 重量オーバーを防ぐため、重いものから順に処理して下に置く
             -(x["dimensions"]["w"] * x["dimensions"]["l"]),
-            -item_volume(x),
-            -x["weight"]
+            -item_volume(x)
         )
     )
 
@@ -92,6 +90,7 @@ def intersects(a, b):
 
 
 def has_support(container, x, y, z, w, l):
+    """支持面判定（接地70%制限）の厳密化"""
     if z == 0:
         return True
 
@@ -100,14 +99,15 @@ def has_support(container, x, y, z, w, l):
 
     for item in container["items"]:
         top_z = item["position"]["z"] + item["dimensions"]["h"]
+        # 高さが一致しているか
         if abs(top_z - z) > 1e-5:
             continue
 
+        # 重なり面積の計算
         overlap_x = max(0, min(x + w, item["position"]["x"] + item["dimensions"]["w"]) - max(x, item["position"]["x"]))
         overlap_y = max(0, min(y + l, item["position"]["y"] + item["dimensions"]["l"]) - max(y, item["position"]["y"]))
         
         support_area += overlap_x * overlap_y
-        
         if support_area >= required_area:
             return True
 
@@ -115,15 +115,24 @@ def has_support(container, x, y, z, w, l):
 
 
 def can_place(container, space, w, l, h, weight):
+    """【違反絶対阻止ガード】"""
+    # 🚨 重量制限違反を絶対に防ぐ（超過したら即座にFalse）
     if container["total_weight"] + weight > MAX_WEIGHT:
         return False
 
+    # 空間サイズ制限
     if w > space.w or l > space.l or h > space.h:
         return False
 
+    # コンテナの物理境界を越えていないかチェック
+    if space.x + w > CONTAINER_WIDTH or space.y + l > CONTAINER_LENGTH or space.z + h > CONTAINER_HEIGHT:
+        return False
+
+    # 支持面チェック
     if not has_support(container, space.x, space.y, space.z, w, l):
         return False
 
+    # 重複チェック
     candidate = {
         "position": {"x": space.x, "y": space.y, "z": space.z},
         "dimensions": {"w": w, "l": l, "h": h}
@@ -136,22 +145,13 @@ def can_place(container, space, w, l, h, weight):
 
 
 def split_space(space, w, l, h):
-    """
-    【高密度・空間分割アルゴリズム】
-    残された空間を無駄にしないよう、より広い連続したスペースを残す3パターンに立体分割
-    """
     new_spaces = []
-
-    # 残り幅・奥行・高さ
     rw, rl, rh = space.w - w, space.l - l, space.h - h
 
-    # 1. X軸方向の分割空きスペース
     if rw > 0:
         new_spaces.append(Space(space.x + w, space.y, space.z, rw, space.l, space.h))
-    # 2. Y軸方向の分割空きスペース
     if rl > 0:
         new_spaces.append(Space(space.x, space.y + l, space.z, w, rl, space.h))
-    # 3. Z軸方向の分割空きスペース
     if rh > 0:
         new_spaces.append(Space(space.x, space.y, space.z + h, w, l, rh))
 
@@ -159,9 +159,6 @@ def split_space(space, w, l, h):
 
 
 def place_item(container, item):
-    """
-    【充填率極大化＆奥詰め評価】
-    """
     best_space = None
     best_orientation = None
     best_score = -float('inf')
@@ -171,25 +168,23 @@ def place_item(container, item):
             if not can_place(container, space, w, l, h, item["weight"]):
                 continue
 
-            # --- 充填率MAXのためのスコアリング ---
-            # ① 空間ジャストフィット度（無駄な隙間を最も作らない場所を最優先）
+            # 空間フィット度
             space_vol = space.volume()
             item_vol = w * l * h
             volume_fit = item_vol / space_vol if space_vol > 0 else 0
 
-            # ② 奥詰め（Deepest-Fit）評価
-            # Y軸（コンテナの奥 y=0）に近いほど、また床面（z=0）に近いほどスコアを高くして隙間なく詰める
+            # 奥詰め ($y=0$ 優先), 下詰め ($z=0$ 優先)
             position_score = (1.0 - (space.y / CONTAINER_LENGTH)) * 0.7 + (1.0 - (space.z / CONTAINER_HEIGHT)) * 0.3
 
-            # ③ 重心バランスの最低限の維持（左右の偏り X軸中央寄せ）
+            # 左右バランス
             center_x = space.x + (w / 2)
             balance_x_score = 1.0 - (abs(center_x - (CONTAINER_WIDTH / 2)) / (CONTAINER_WIDTH / 2))
 
-            # 総合スコア（★タイポを修正：数値からカンマを除去しました）
+            # 【スコアバランスの正常化】暴走を防ぐため、桁数を現実的な範囲に修正
             fit_score = (
-                (volume_fit * 2000000) +  # 充填率ボーナスを極大化（200万倍）
-                (position_score * 500000) + # 奥からギチギチに詰める
-                (balance_x_score * 100000)  # 左右の重心バランス
+                (volume_fit * 10000) +
+                (position_score * 5000) +
+                (balance_x_score * 1000)
             )
 
             if fit_score > best_score:
@@ -203,7 +198,7 @@ def place_item(container, item):
     w, l, h, rotated = best_orientation
     placed = {
         "item_id": item["item_id"],
-        "destination_id": destination_id if 'destination_id' in locals() else item["destination_id"],
+        "destination_id": item["destination_id"],
         "size_type": item["size_type"],
         "dimensions": {"w": w, "l": l, "h": h},
         "position": {"x": best_space.x, "y": best_space.y, "z": best_space.z},
@@ -218,7 +213,7 @@ def place_item(container, item):
     new_sub_spaces = split_space(best_space, w, l, h)
     container["spaces"].extend(new_sub_spaces)
 
-    # 空間リストをソート（奥 y=0、下 z=0、左 x=0 を常に優先探索するように固定）
+    # 探索順の固定
     container["spaces"] = sorted(container["spaces"], key=lambda s: (s.y, s.z, s.x))
 
     return True
